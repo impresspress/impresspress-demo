@@ -1,0 +1,209 @@
+// Persists across the navigations sw.js triggers when it self-destructs,
+// so the very next page load hits the recovery path (below) instead of
+// re-registering the SW with the same stale browser-cached modules.
+const SW_RECOVER_KEY = '__impresspress_sw_recover';
+// Set once the recovery path has already run in this tab. A second
+// self-destruct after recovery means wiping SW + caches (and OPFS, when
+// allowed) didn't resolve the underlying failure — looping again would
+// just burn another `?_freshen` reload and crash the same way. We surface
+// to the user via `renderRecoveryStuckUI` instead.
+const RECOVERY_DONE_KEY = '__impresspress_recovery_done';
+// Whether the recovery path should wipe OPFS. Set per-build via the
+// `opfs_wipe_on_recovery` field on the bundle config (CLI flag
+// `--opfs-wipe-on-recovery`). Demo builds set it true so a schema-drift
+// loop self-resolves; production apps whose OPFS holds user data leave
+// it false and surface the error instead.
+const OPFS_WIPE_ON_RECOVERY = true;
+// A pending Service Worker response has no useful browser-level deadline.
+// Recover explicitly instead of leaving the boot shell spinning forever.
+const BOOT_PROBE_TIMEOUT_MS = 60_000;
+
+// Unregister all SWs, drop Cache Storage, and (if asked) clear OPFS.
+// Used both by automatic recovery and by the manual reset button on the
+// stuck-UI fallback, so the wipe semantics stay in one place.
+async function wipeBrowserState({ wipeOpfs }) {
+    try {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        for (const r of regs) await r.unregister();
+        const keys = await caches.keys();
+        for (const k of keys) await caches.delete(k);
+    } catch (e) {
+        console.error('[impresspress-web] cache wipe failed:', e);
+    }
+    if (wipeOpfs) {
+        try {
+            if (navigator.storage && navigator.storage.getDirectory) {
+                const root = await navigator.storage.getDirectory();
+                for await (const [name] of root.entries()) {
+                    await root.removeEntry(name, { recursive: true });
+                }
+            }
+        } catch (e) {
+            console.error('[impresspress-web] OPFS wipe failed:', e);
+        }
+    }
+}
+
+// Fallback UI shown when automatic recovery can't break the failure loop.
+// Replaces the loader card with an explanation and a manual reset button.
+// The button does a full wipe including OPFS regardless of
+// OPFS_WIPE_ON_RECOVERY — the user has explicitly opted in by clicking.
+function renderRecoveryStuckUI() {
+    const card = document.querySelector('.loader') || document.body;
+    card.innerHTML =
+        '<div style="max-width:480px;margin:0 auto;text-align:left;padding:1.5rem;font:inherit;line-height:1.5;">' +
+        '<h1 style="margin-top:0;font-size:1.25rem;">impresspress-web couldn\'t start</h1>' +
+        '<p>Your local data is incompatible with the current version of this app, and automatic recovery didn\'t resolve it.</p>' +
+        '<p>Resetting will erase data stored locally in this browser and reload the app.</p>' +
+        '<button id="impresspress-reset" style="background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:0.6rem 1rem;font:inherit;cursor:pointer;">Reset local data and reload</button>' +
+        '</div>';
+    document.getElementById('impresspress-reset').addEventListener('click', async () => {
+        const btn = document.getElementById('impresspress-reset');
+        btn.disabled = true;
+        btn.textContent = 'Resetting…';
+        await wipeBrowserState({ wipeOpfs: true });
+        try { localStorage.clear(); } catch (_) {}
+        try { sessionStorage.clear(); } catch (_) {}
+        // Strip the `?_freshen` query so the next boot starts from a clean URL.
+        window.location.replace(window.location.origin + window.location.pathname);
+    });
+}
+
+// Run one automatic reset in this tab. Both a Service Worker self-destruct and
+// a timed-out readiness probe use this path, so their loop guard and wipe
+// semantics cannot drift apart.
+async function recoverBrowserState(status) {
+    if (sessionStorage.getItem(RECOVERY_DONE_KEY)) {
+        renderRecoveryStuckUI();
+        return;
+    }
+    sessionStorage.setItem(RECOVERY_DONE_KEY, '1');
+    status.textContent = 'Recovering from stale cache...';
+    await wipeBrowserState({ wipeOpfs: OPFS_WIPE_ON_RECOVERY });
+    const url = new URL(window.location.href);
+    url.searchParams.set('_freshen', String(Date.now()));
+    window.location.replace(url.toString());
+}
+
+async function boot() {
+    const status = document.getElementById('status');
+    if (!('serviceWorker' in navigator)) {
+        status.textContent = 'Service Workers not supported in this browser.';
+        return;
+    }
+
+    // Recovery path: a previous boot's SW self-destructed and signalled the
+    // page to set the breaker. Wipe all SW + cache state AND clear OPFS,
+    // force a fresh document fetch via a cache-busting query string, and let
+    // the next load proceed normally.
+    //
+    // OPFS wipe is the critical step for any schema-drift class of bug: if
+    // the OPFS DB was written by a prior build with an incompatible schema,
+    // re-registering the SW against the same OPFS will keep failing
+    // `initialize()` and re-entering recovery forever (caches + SW are
+    // already innocent in that scenario). For a browser-local demo this
+    // costs the user's local rows but breaks the loop; that trade-off is
+    // why self-destruct fires in the first place.
+    if (sessionStorage.getItem(SW_RECOVER_KEY)) {
+        sessionStorage.removeItem(SW_RECOVER_KEY);
+        await recoverBrowserState(status);
+        return;
+    }
+
+    // Listen for self-destruct notices. The SW posts this message just
+    // before re-navigating its clients, so by the time the navigation
+    // lands, the breaker is set and the recovery path above runs.
+    navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.data?.type === 'sw-self-destruct') {
+            sessionStorage.setItem(SW_RECOVER_KEY, '1');
+        }
+    });
+
+    try {
+        status.textContent = 'Registering Service Worker...';
+        const registration = await navigator.serviceWorker.register('/sw.js', {
+            type: 'module',
+            scope: '/',
+            updateViaCache: 'none',
+        });
+        // Force an update check on every page load. `register()` only checks
+        // when the script bytes differ from the cached copy, and even then
+        // browsers may delay the check up to 24h. Calling update() explicitly
+        // means a deploy is picked up the next time the user visits the page,
+        // not the next time the browser feels like polling. controllerchange
+        // (wired below) handles the reload once the new SW takes over.
+        try { await registration.update(); } catch (e) {
+            console.warn('[impresspress-web] SW update check failed:', e);
+        }
+        const sw = registration.installing || registration.waiting || registration.active;
+        if (sw && sw.state !== 'activated') {
+            await new Promise((resolve) => {
+                sw.addEventListener('statechange', () => {
+                    if (sw.state === 'activated') resolve();
+                });
+                if (sw.state === 'activated') resolve();
+            });
+        }
+        // Auto-reload when a new SW takes control (subsequent updates).
+        // __impresspressReloading is the shared breaker for every navigation
+        // below: this listener, the first-registration reload, and the boot
+        // redirect.
+        if (!window.__impresspressReloading) {
+            navigator.serviceWorker.addEventListener('controllerchange', () => {
+                if (window.__impresspressReloading) return;
+                window.__impresspressReloading = true;
+                window.location.reload();
+            });
+        }
+        if (!navigator.serviceWorker.controller) {
+            status.textContent = 'First-time setup complete. Loading impresspress-web...';
+            window.__impresspressReloading = true;
+            window.location.reload();
+            return;
+        }
+        status.textContent = 'Loading impresspress-web...';
+        const target = new URL('/', window.location.href);
+        window.__impresspressReloading = true;
+        if (target.href === window.location.href) {
+            // A claimed worker initializes lazily on its first fetch. Probe
+            // the boot URL before reloading so a cold public origin does not
+            // race that initialization and render the static loader twice.
+            // Recovery remains owned by sw.js: a fatal probe self-destructs
+            // the worker and notifies/navigates this client.
+            const probeController = new AbortController();
+            const probeTimeout = setTimeout(
+                () => probeController.abort(),
+                BOOT_PROBE_TIMEOUT_MS,
+            );
+            try {
+                await fetch(target.href, {
+                    cache: 'no-store',
+                    credentials: 'same-origin',
+                    signal: probeController.signal,
+                });
+            } catch (error) {
+                if (probeController.signal.aborted) {
+                    console.warn('[impresspress-web] Boot probe timed out; recovering.');
+                    await recoverBrowserState(status);
+                    return;
+                }
+                console.warn('[impresspress-web] Boot probe failed:', error);
+            } finally {
+                clearTimeout(probeTimeout);
+            }
+            // A fatal probe self-destructs the worker, which sets the breaker
+            // and re-navigates this client itself. Reloading on top of that
+            // would be a second, uncoordinated navigation, so stand down and
+            // let the recovery path above run on the load sw.js is starting.
+            if (sessionStorage.getItem(SW_RECOVER_KEY)) return;
+            // Leave the current navigation task before requesting the reload.
+            setTimeout(() => window.location.reload(), 0);
+        } else {
+            window.location.replace(target.href);
+        }
+    } catch (error) {
+        status.textContent = 'Error: ' + error.message;
+        console.error('[impresspress-web] Boot error:', error);
+    }
+}
+boot();

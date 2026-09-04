@@ -1,0 +1,17 @@
+{
+  "name": "impresspress-web",
+  "type": "module",
+  "description": "Impresspress compiled to WASM for running in the browser via Service Worker",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "impresspress_web_bg.wasm",
+    "impresspress_web.js",
+    "impresspress_web.d.ts"
+  ],
+  "main": "impresspress_web.js",
+  "types": "impresspress_web.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

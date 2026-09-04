@@ -1,0 +1,302 @@
+// @generated build: ad0fdd7b — Service Worker that runs Impresspress via WASM
+import init, { initialize, handle_request } from '/impresspress_web-7e209472.js';
+
+// Whether this bundle carries the browser development sandbox, rendered from
+// `[dev] enabled` at BUILD time (`impresspress-bundle`'s `DEV_ENABLED` var).
+//
+// ONE constant, read by BOTH places the flag decides something: the
+// `initialize({ dev: DEV_ENABLED })` below, and the isolation-header
+// passthrough in the fetch handler. It used to be the placeholder itself
+// substituted at both sites, which meant a shipped `sw.js` stated the same
+// fact twice — and the dev sandbox's export (`blocks/dev/export.rs`), which
+// ships the runtime shell with the sandbox turned OFF, then had to find and
+// rewrite two different renderings and assert both. One line, one rewrite,
+// one assertion: flipping the declaration below from true to false is the
+// whole of turning a dev bundle into a plain one. (Deliberately NOT spelled
+// out here as a literal: the export finds the declaration by exact text and
+// requires it to occur exactly once, so a comment quoting it would be a
+// second, ambiguous match.)
+const DEV_ENABLED = false;
+
+let initialized = false;
+let initPromise = null;
+// Set after a fatal wasm error (init failure or runtime trap). A poisoned SW
+// stops handling fetches with wasm and unregisters itself so the next page
+// load picks up a fresh registration. Without this, a stale SW from a prior
+// deploy whose hashed asset URL no longer exists keeps returning 5xx forever
+// — the user has to manually unregister via DevTools to recover.
+let poisoned = false;
+
+async function selfDestruct(reason) {
+    if (poisoned) return;
+    poisoned = true;
+    console.error('[impresspress-web] SW self-destructing:', reason);
+    try {
+        await self.registration.unregister();
+        const clients = await self.clients.matchAll({ type: 'window' });
+        for (const c of clients) {
+            // Notify the page so loader.js sets its sessionStorage breaker
+            // BEFORE the navigation below. The breaker routes the next load
+            // through a recovery path (clear caches, drop any lingering SW,
+            // bust the document cache, reload once) — that breaks
+            // stale-module loops where a fresh `*_bg.wasm` can't link
+            // against a browser-cached previous-build `*.js`.
+            try {
+                c.postMessage({ type: 'sw-self-destruct', reason });
+            } catch (e) {
+                console.warn('[impresspress-web] postMessage failed:', e);
+            }
+            try {
+                c.navigate(c.url);
+            } catch (e) {
+                console.warn('[impresspress-web] navigate() failed:', e);
+            }
+        }
+    } catch (e) {
+        console.error('[impresspress-web] self-destruct cleanup failed:', e);
+    }
+}
+
+async function ensureInitialized() {
+    if (initialized) return;
+    if (initPromise) return await initPromise;
+    initPromise = (async () => {
+        console.log('[impresspress-web] Loading WASM module...');
+        try {
+            await init();
+        } catch (e) {
+            await selfDestruct(`wasm module load failed: ${e}`);
+            throw e;
+        }
+        console.log('[impresspress-web] Initializing runtime...');
+        try {
+            await initialize({ dev: DEV_ENABLED });
+        } catch (e) {
+            await selfDestruct(`runtime initialize() failed: ${e}`);
+            throw e;
+        }
+        initialized = true;
+        console.log('[impresspress-web] Runtime ready.');
+    })();
+    await initPromise;
+}
+
+self.addEventListener('install', (event) => {
+    console.log('[impresspress-web] Service Worker installing...');
+    event.waitUntil(self.skipWaiting());
+});
+
+self.addEventListener('activate', (event) => {
+    console.log('[impresspress-web] Service Worker activating...');
+    event.waitUntil(self.clients.claim());
+});
+
+// ---------------------------------------------------------------------------
+// Message bridge — asset-loader replies from the main thread.
+// ---------------------------------------------------------------------------
+
+self.addEventListener('message', (event) => {
+    const msg = event.data;
+    if (!msg) return;
+
+    // Asset loader bridge: route reply to bridge.js's pending-load map.
+    // bridge.js exposes the resolver on globalThis because this script
+    // (sw.js) doesn't import the wasm-bindgen-generated bridge module.
+    if (msg.type === 'load-asset-response') {
+        if (typeof globalThis.__impresspressCompleteAssetLoad === 'function') {
+            globalThis.__impresspressCompleteAssetLoad(msg.id, {
+                status: msg.ok ? 'ready' : 'failed',
+                error: msg.ok ? undefined : msg.error,
+            });
+        }
+        return;
+    }
+
+    // LLM bridge: route all llm-* replies from the page to bridge.js's handler.
+    if (typeof msg.type === 'string' && msg.type.startsWith('llm-')) {
+        if (typeof globalThis.__impresspressCompleteLlmMessage === 'function') {
+            globalThis.__impresspressCompleteLlmMessage(msg);
+        }
+        return;
+    }
+
+    // Embed bridge: route all embed-*-response replies from the page to bridge.js's handler.
+    if (typeof msg.type === 'string' && msg.type.startsWith('embed-') && msg.type.endsWith('-response')) {
+        if (typeof globalThis.__impresspressCompleteEmbedMessage === 'function') {
+            globalThis.__impresspressCompleteEmbedMessage(msg);
+        }
+        return;
+    }
+
+    // Image bridge: route all image-* replies (one-shot responses and stream
+    // frames) from the page to bridge.js's handler.
+    if (typeof msg.type === 'string' && msg.type.startsWith('image-')) {
+        if (typeof globalThis.__impresspressCompleteImageMessage === 'function') {
+            globalThis.__impresspressCompleteImageMessage(msg);
+        }
+        return;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Fetch handler
+// ---------------------------------------------------------------------------
+
+self.addEventListener('fetch', (event) => {
+    const url = new URL(event.request.url);
+    // Only intercept same-origin requests
+    if (url.origin !== self.location.origin) return;
+    // Don't intercept requests for the SW's own script, the boot loader, the
+    // PWA manifest (which the browser fetches as metadata), or the wasm-pack /
+    // bundler output. `/` and `/index.html` are intentionally INTERCEPTED so
+    // the consumer's router can render a UI block at root.
+    //
+    // Consumers inject additional app-specific bypass prefixes via the
+    // `--extra-bypass-prefix` flag on export-assets; those get appended to
+    // the last line of the `if` expression below as further `startsWith`
+    // clauses. That's where app-level static assets (custom JS / CSS)
+    // should be listed.
+    if (url.pathname === '/sw.js' ||
+        url.pathname === '/loader.js' ||
+        url.pathname === '/manifest.json' ||
+        url.pathname === '/asset-manifest.json' ||
+        url.pathname === '/webllm-engine.js' ||
+        url.pathname === '/embed-engine.js' ||
+        url.pathname === '/t2i-engine.js' ||
+        url.pathname.startsWith('/impresspress_web') ||
+        url.pathname.startsWith('/snippets/') ||
+        url.pathname.startsWith('/vendor/') ||
+        url.pathname.startsWith('/sql-')) {
+        // ------------------------------------------------------------------
+        // Bypassed — the network answers this, not the wasm runtime.
+        //
+        // In a NON-dev bundle that is the whole story: return, and the
+        // browser performs the fetch it would have performed with no service
+        // worker at all.
+        //
+        // In a DEV bundle it is not, and the reason is a rule that is easy to
+        // miss. A document with a `Cross-Origin-Embedder-Policy` inherits
+        // that policy to every dedicated worker it starts, and the browser
+        // REFUSES to start one whose own script response does not carry a
+        // compatible COEP. The sandbox's `/b/dev` is COEP `credentialless`
+        // (it needs `SharedArrayBuffer` for the in-browser Rust toolchain),
+        // and the toolchain's worker script is one of the files bypassed
+        // above — a quarter of a gigabyte of static assets that must not go
+        // through wasm. So the runtime never sees that response and cannot
+        // put a header on it; the static host does, and a static host that
+        // says nothing gets `net::ERR_BLOCKED_BY_RESPONSE` plus a `Worker`
+        // `error` event with an empty message, which is all the page can ever
+        // be told.
+        //
+        // Which static host? `python3 -m http.server` in CI, Cloudflare's
+        // asset server in production, whatever a contributor runs locally.
+        // "Every host that ever serves this bundle must be configured to send
+        // a header" is a rule with no enforcement point. The service worker
+        // is the one thing that ships INSIDE the bundle and sits in front of
+        // every same-origin request, so it is the deployment's header layer —
+        // the coi-serviceworker pattern, applied to the requests this worker
+        // otherwise waves through.
+        //
+        // Hence: a dev bundle answers the bypassed request itself, with the
+        // network's own response plus the cross-origin-isolation pair. The
+        // pair matches what the runtime already sends on everything it serves
+        // in a dev deployment (the security-headers block's
+        // `cross_origin_isolation`), so this makes the static files CONSISTENT
+        // with the rest of the origin rather than special.
+        //
+        // `credentialless` rather than `require-corp`: a site an agent built
+        // in this sandbox can still show a cross-origin image that carries no
+        // `Cross-Origin-Resource-Policy`, which under `require-corp` it could
+        // not.
+        //
+        // Every bypassed path, not just the toolchain's: the bypass list is
+        // the APP's (`--extra-bypass-prefix`), so this worker cannot know
+        // which of those prefixes an app loads a worker script from — and the
+        // headers are inert on every response that is neither a document nor
+        // a worker script, so widening the rule costs nothing and narrowing it
+        // would be a guess.
+        //
+        // `/sw.js` is kept out. The browser fetches a worker's own script
+        // outside any worker's `fetch` handler, so this branch should never
+        // see it; if some future browser routes it here anyway, answering it
+        // from inside the worker being replaced is how an update check gets a
+        // stale script.
+        //
+        // The condition below reads `DEV_ENABLED`, the single build-time
+        // constant declared at the top of this file (the same one
+        // `initialize()` is passed), so the difference between a dev bundle
+        // and a plain one is visible in ONE line of the shipped file rather
+        // than decided at runtime — and a non-dev bundle keeps the plain
+        // early return it always had. Flipping that one line is also exactly
+        // what the sandbox's export rewrites to ship the shell with the
+        // sandbox off (`blocks/dev/export.rs`).
+        // ------------------------------------------------------------------
+        if (DEV_ENABLED && url.pathname !== '/sw.js') {
+            event.respondWith(passthrough(event.request));
+        }
+        return;
+    }
+    event.respondWith(handleFetch(event.request));
+});
+
+/**
+ * The network's answer to a bypassed request, plus the cross-origin-isolation
+ * headers. See the long comment in the `fetch` listener for why this exists.
+ *
+ * The body is PIPED, never buffered: the assets this runs on include
+ * multi-megabyte wasm parts, and reading one into an ArrayBuffer to hand it
+ * back would double the peak memory of every load for no gain. `response.body`
+ * is the original stream; the new `Response` wraps it.
+ *
+ * An opaque, opaque-redirect or error response is returned untouched. Its
+ * headers are not readable and its body is not exposed, so constructing a new
+ * `Response` from one does not copy it — it silently replaces it with an empty
+ * 200, which is far worse than the missing header this function exists to add.
+ * (Same-origin requests should never produce one here, since the cross-origin
+ * check above already returned; this is the guard for the case where they do.)
+ */
+async function passthrough(request) {
+    const response = await fetch(request);
+    if (response.type === 'opaque' || response.type === 'opaqueredirect' || response.type === 'error') {
+        return response;
+    }
+    const headers = new Headers(response.headers);
+    headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
+    headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+    // `response.body` is null exactly for the statuses that may not have one
+    // (204, 205, 304), which is also the set `new Response` rejects a body
+    // for — so this one expression is correct for both cases.
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+    });
+}
+
+async function handleFetch(request) {
+    if (poisoned) {
+        // wasm is dead — let the network serve this. The page should already
+        // be in the middle of a re-navigation triggered by selfDestruct().
+        return fetch(request);
+    }
+    try {
+        await ensureInitialized();
+        return await handle_request(request);
+    } catch (error) {
+        console.error('[impresspress-web] Error handling request:', error);
+        // wasm-bindgen surfaces a `RuntimeError` for an `unreachable` trap;
+        // ensureInitialized() also synthesises errors for `init()` /
+        // `initialize()` failures (most often caused by a stale browser
+        // module cache pointing at filenames the new build no longer has).
+        // Both modes mean the wasm instance is unusable for the rest of
+        // this SW's life, so self-destruct (which posts the breaker
+        // message and triggers a re-navigation) and fall through to
+        // network — that lets the browser fetch the static boot HTML
+        // instead of seeing the raw error JSON, which is what runs
+        // loader.js's recovery path.
+        if (!poisoned) {
+            await selfDestruct(`error handling request: ${error}`);
+        }
+        return fetch(request);
+    }
+}
