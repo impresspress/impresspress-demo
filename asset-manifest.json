@@ -1,0 +1,21 @@
+{
+  "buildId": "685f51c6",
+  "assets": {
+    "impresspress_web.js": "/impresspress_web-ca347859.js",
+    "impresspress_web_bg.wasm": "/impresspress_web_bg-5856e85f.wasm"
+  },
+  "files": [
+    "asset-manifest.json",
+    "embed-engine.js",
+    "impresspress_web-ca347859.js",
+    "impresspress_web_bg-5856e85f.wasm",
+    "index.html",
+    "loader.js",
+    "snippets/impresspress-browser-c1e2ee996fd2ab06/js/bridge.js",
+    "sw.js",
+    "t2i-engine.js",
+    "vendor/sql-wasm-esm.js",
+    "vendor/sql-wasm.wasm",
+    "webllm-engine.js"
+  ]
+}
