@@ -1,0 +1,848 @@
+// @generated build: 45dfa139 — Service Worker that runs Impresspress via WASM
+import init, { initialize, handle_request } from '/impresspress_web-4ecc1505.js';
+
+// Whether this bundle carries the browser development sandbox, rendered from
+// `[dev] enabled` at BUILD time (`impresspress-bundle`'s `DEV_ENABLED` var).
+//
+// ONE constant, read by BOTH places the flag decides something: the
+// `initialize({ dev: DEV_ENABLED, … })` below, and the isolation-header
+// passthrough in the fetch handler. It used to be the placeholder itself
+// substituted at both sites, which meant a shipped `sw.js` stated the same
+// fact twice — and the dev sandbox's export (`blocks/dev/export.rs`), which
+// ships the runtime shell with the sandbox turned OFF, then had to find and
+// rewrite two different renderings and assert both. One line, one rewrite,
+// one assertion: flipping the declaration below from true to false is the
+// whole of turning a dev bundle into a plain one. (Deliberately NOT spelled
+// out here as a literal: the export finds the declaration by exact text and
+// requires it to occur exactly once, so a comment quoting it would be a
+// second, ambiguous match.)
+const DEV_ENABLED = false;
+
+// The requests the fetch handler below leaves to the network, as data:
+// `impresspress-bundle` renders this object and that handler's `if (…)`
+// condition from ONE value (`BypassRules`, `bundle/bypass.rs`). It is handed
+// to the runtime in `initialize()`, so the runtime knows exactly which paths
+// THIS worker will never ask it for — the development sandbox refuses a site
+// file at one, because the file would publish and never be shown. Read from
+// the running worker rather than fetched, so it is the rules in force, not
+// the ones a newer deployment may already be serving.
+const BYPASS_RULES = {"exact":["/sw.js","/loader.js","/manifest.json","/asset-manifest.json","/webllm-engine.js","/embed-engine.js","/t2i-engine.js","/vendor/sql-wasm-esm.js","/vendor/sql-wasm.wasm"],"prefixes":["/impresspress_web","/snippets/","/cdn-cgi/"]};
+
+// The page-side model engines this bundle ships (`impresspress-bundle`'s
+// `PAGE_ENGINES`, the same list the boot shell's script tags and the bypass
+// rules above come from), handed to the runtime in `initialize()`: every page
+// it renders loads them, so a model request `bridge.js` posts to a page finds
+// an engine there.
+const PAGE_ENGINES = ["/webllm-engine.js","/embed-engine.js","/t2i-engine.js"];
+
+// The runtime binary this worker runs: the hashed `.wasm` the glue above was
+// built for, rendered from the same name the bundler wrote into the glue.
+// Content-addressed, so this URL is this version's runtime and no other's.
+const RUNTIME_URL = '/impresspress_web_bg-e39491ee.wasm';
+// Where every version of this worker keeps its own runtime binary, keyed by
+// RUNTIME_URL: put there at `install`, read from there by `init()`, and the
+// other versions' entries dropped at `activate`.
+//
+// Why it is kept and not fetched when needed: the browser keeps a worker's
+// SCRIPTS (this file and the glue it imports) with the installed version,
+// but not what the worker fetches at runtime — and `init()` fetches the
+// binary. A deployment deletes the previous binary from the host, and a
+// returning visitor's worker is usually one the browser stopped while idle.
+// The visit after a deploy starts that OLD worker again to answer it, before
+// the browser's update check has installed the new one; fetching its runtime
+// from the host then gets a 404, the worker dies at stage `load`, and the
+// boot shell's recovery starts replacing it while the browser is installing
+// the update. Kept here, the old worker boots the runtime it was installed
+// with, answers the visit, and is replaced by the update like any live
+// worker (`sw-update.spec.ts` stops the worker before the deploy visit).
+//
+// One binary per version, and one version kept once a new one activates —
+// a few megabytes of the origin's quota, which it shares with the app's
+// local data. A version whose binary the host does not have fails to install,
+// and a browser keeps the worker it has rather than switch to one that
+// cannot start: the host no longer has the binary, or what it answered is
+// not a WebAssembly module at all — a host that falls
+// back to its app shell for unknown paths (the dev sandbox's
+// `not_found_handling = "single-page-application"`) answers a deleted binary
+// with a 200 and an HTML page (`keepRuntime`). A full quota does NOT fail
+// the install: the version keeps nothing and loads its runtime from the
+// host, as every version did before this cache.
+//
+// `loader.js`'s recovery drops this cache with every other one, so the
+// replacement it registers fetches its runtime afresh; `runtimeBinary`
+// falls back to the host for a worker whose entry has gone.
+const RUNTIME_CACHE = '__impresspress_runtime';
+
+// The Web Lock `loader.js` holds from before it registers a replacement
+// worker until it has erased the app's local data (`ERASE_LOCK` there, which
+// says why; the same name). The runtime's `initialize()` loads that data —
+// into memory, to be written back on every flush — so it must not run while
+// an erase is pending. No version WAITS for the lock, though (`eraseSettled`
+// says why): each one looks, and while it is held answers without loading.
+const ERASE_LOCK = '__impresspress_erase';
+
+// Thrown by `eraseSettled` while an erase is pending: this worker must not
+// load the data, and must not wait for the erase either (see there). It is
+// not a death — nothing is poisoned — and the request is answered by
+// `beingReset`.
+class ErasePending extends Error {}
+
+/**
+ * Throws ErasePending if an erase is pending (ERASE_LOCK is held), where the
+ * worker has Web Locks; otherwise resolves, and the runtime may load.
+ *
+ * It only LOOKS at the lock (`ifAvailable`), in every version, and never
+ * waits for it inside an event. The erase that holds it may be a reset's,
+ * waiting for its replacement to activate — which a browser does only once
+ * the worker being replaced is between events — or about to register that
+ * replacement. A worker waiting for the lock inside a request's event would
+ * make the reset wait for an activation its own lock prevents. Looking costs
+ * nothing of the kind: the request is answered that the app is being reset
+ * (`beingReset`), the event ends, and the next request looks again.
+ *
+ * And no version needs to wait: the replacement an erase is for exists only
+ * once registered, which the erase does holding the lock, and receives
+ * requests only once activated — so the first time it could load the data
+ * it looks, and loads only once the erase has let go of the lock.
+ */
+async function eraseSettled() {
+    const locks = self.navigator && self.navigator.locks;
+    if (!(locks && locks.request)) return;
+    const pending = await locks.request(ERASE_LOCK, { ifAvailable: true }, (lock) => lock === null);
+    if (pending) throw new ErasePending('the app is being reset');
+}
+
+let initialized = false;
+let initPromise = null;
+// Set after a fatal wasm error (init failure or runtime trap). A poisoned
+// worker stops handling requests with wasm for the rest of ITS life: it
+// answers a navigation with the boot shell and everything else with a 503
+// that carries the cause (`runtimeStopped`).
+//
+// It stays registered, and is never unregistered. An unregistered worker
+// is no longer asked for navigations, so every path only the runtime serves
+// (`/b/…`) would become the static host's to answer — its 404, on a host
+// with no fallback for unknown paths — and a reload of the page the failure
+// happened on would lose the person the app. Registered, this worker can
+// hand any navigation in its scope to the boot shell, whose recovery
+// REPLACES it in place: it registers this same file under a new script URL
+// over this registration (`WORKER_URL` in `loader.js`), and the version
+// that installs takes over through `skipWaiting` / `clients.claim` below,
+// exactly as a new deployment's does.
+//
+// Nor is it a trap without the shell: `poisoned` is this instance's memory,
+// so a worker the browser stops and starts again tries `initialize()`
+// afresh.
+let poisoned = false;
+// Why it is poisoned: the `reason` `selfDestruct` was called with. Kept so
+// every request this worker refuses from then on can say what happened —
+// see `runtimeStopped`.
+let poisonReason = '';
+// WHERE it failed — `STAGE_LOAD`, `STAGE_INITIALIZE` or `STAGE_REQUEST` —
+// stated by the code that caught the failure and sent beside the cause on
+// every road to `loader.js` (the message, the Cache Storage entry, the 503).
+// It is what the loader's recovery decides on, so it is a field of its own:
+// nothing ever reads it back out of `poisonReason`.
+let poisonStage = '';
+// WHICH death this is: an id made once, when this worker is poisoned. Sent
+// beside the cause on every road, the same on each.
+// A worker answers many navigations after it dies and several tabs may hold
+// its cause at once; the id is how `loader.js` knows they are all about ONE
+// failure, so that the tab that recovers from it does so for the others too
+// and none of them recovers — or erases — a second time.
+let poisonId = '';
+
+// The wasm module could not be fetched or instantiated (`init()`): a kept
+// binary that is gone and a host that no longer has it either, a network
+// failure, a module the browser cannot compile. Says nothing about the data
+// this browser stores for the app.
+const STAGE_LOAD = 'load';
+// The runtime's `initialize()` failed: opening the database, migrating it,
+// importing the seed. The one failure that can mean the stored data is not
+// what this build can use.
+const STAGE_INITIALIZE = 'initialize';
+// A started runtime died handling a request. The data was good enough to
+// start on, so this says nothing about it either.
+const STAGE_REQUEST = 'request';
+
+// Whether `loader.js`'s recovery may erase the data this browser stores for
+// the app (OPFS) — the same build-time flag `loader.js` is rendered with.
+// Here so that the 503 can say what the recovery it leads to costs:
+// `recoveryErases` is the same rule as `erasesFor` there.
+const OPFS_WIPE_ON_RECOVERY = true;
+
+// The longest cause kept. A wasm-bindgen error can carry a whole stack; the
+// reader needs the first line or two. (The console line has all of it.)
+const CAUSE_MAX_CHARS = 300;
+
+// Where the cause is left for the boot shell: one entry in one Cache Storage
+// cache, which `loader.js` reads and deletes (the same two names are declared
+// there). Cache Storage because it is the one store both this worker and a
+// page can reach that needs no listener on the page: a page the runtime
+// rendered has no `message` handler, the navigation that hit the failure has
+// no client to post to yet, and `sessionStorage` does not exist in a worker.
+// Not a query parameter on the navigated URL either — that only reaches the
+// clients this worker navigates, never the navigation that failed, and it
+// would put an error message in the address bar and the history.
+const STOP_CAUSE_CACHE = '__impresspress_sw_stopped';
+const STOP_CAUSE_KEY = '/__impresspress_sw_stopped';
+
+// The boot shell's own URL: the one address the static host itself must
+// answer, because a first visit — no worker yet — starts there. It is where
+// this worker gets the shell document it answers a navigation with once the
+// runtime is dead (`bootShell`). Rendered from the bundler's one `SHELL_URL`,
+// which `loader.js` is rendered with too.
+const SHELL_URL = '/';
+
+/**
+ * The runtime is dead for the rest of this worker's life. Poison the worker
+ * (see `poisoned` for why it stays registered).
+ *
+ * `stage` is where it failed (`poisonStage`).
+ *
+ * `toBootShell` says whether the open pages are also sent to the boot shell,
+ * and it is the caller's to decide because it depends on what failed:
+ *
+ * - `true` — nothing can be served at all (`init()` / `initialize()` failed),
+ *   or a NAVIGATION failed and its document is going to be the boot shell
+ *   anyway (`runtimeStopped` answers it with the shell). The cause is left
+ *   for the shell (`leaveCauseForBootShell`), each page is told and
+ *   re-navigated to its own address — which this worker answers with the
+ *   shell — and `loader.js` runs its recovery path with the cause on screen.
+ * - `false` — a request FROM a page failed (an API call, a form post) after
+ *   the runtime had started. The page is left exactly where it is: the
+ *   request gets `runtimeStopped`'s 503 and the page shows the cause.
+ *   Re-navigating here would replace the page a moment after the cause
+ *   reached it, with a clean form that says nothing. When the person reloads
+ *   it, that navigation gets the shell like any other.
+ */
+async function selfDestruct(reason, stage, toBootShell) {
+    if (poisoned) return;
+    poisoned = true;
+    poisonStage = stage;
+    poisonId = crypto.randomUUID();
+    poisonReason = String(reason);
+    if (poisonReason.length > CAUSE_MAX_CHARS) {
+        poisonReason = `${poisonReason.slice(0, CAUSE_MAX_CHARS)}…`;
+    }
+    console.error('[impresspress-web] SW self-destructing:', reason);
+    if (!toBootShell) return;
+    await leaveCauseForBootShell();
+    try {
+        const clients = await self.clients.matchAll({ type: 'window' });
+        for (const c of clients) {
+            // Notify the page so loader.js sets its sessionStorage breaker
+            // BEFORE the navigation below. Only the boot shell listens;
+            // every other page gets the cause from the cache entry, which
+            // the navigation below leaves again when this worker answers it.
+            try {
+                c.postMessage({
+                    type: 'sw-self-destruct',
+                    reason: poisonReason,
+                    stage: poisonStage,
+                    id: poisonId,
+                    runtime: RUNTIME_URL
+                });
+            } catch (e) {
+                console.warn('[impresspress-web] postMessage failed:', e);
+            }
+            // To the client's own address: this worker is still registered,
+            // so it answers that navigation with the boot shell whatever the
+            // static host has there, and the shell's recovery can bring the
+            // person back to the same page.
+            //
+            // `navigate()` returns a promise, and rejects for a client this
+            // worker does not control: the `.catch` is for that, the `try`
+            // for a client that has no `navigate` at all.
+            try {
+                c.navigate(c.url).catch((e) => {
+                    console.warn('[impresspress-web] navigate() failed:', e);
+                });
+            } catch (e) {
+                console.warn('[impresspress-web] navigate() failed:', e);
+            }
+        }
+    } catch (e) {
+        console.error('[impresspress-web] self-destruct cleanup failed:', e);
+    }
+}
+
+/**
+ * Leave what this worker reports where the boot shell will find it — see
+ * `STOP_CAUSE_CACHE`. `id` is the death's own and the same on every leave.
+ * `at` is when THIS entry was left: it lets the shell tell a cause left for
+ * the navigation in progress from one no shell ever came to read. (Not when
+ * the worker died: a poisoned worker stays poisoned, and a reload ten
+ * minutes after it died is still a navigation in progress.)
+ */
+async function leaveCauseForBootShell() {
+    try {
+        const cache = await caches.open(STOP_CAUSE_CACHE);
+        await cache.put(
+            STOP_CAUSE_KEY,
+            new Response(
+                JSON.stringify({
+                    reason: poisonReason,
+                    stage: poisonStage,
+                    id: poisonId,
+                    runtime: RUNTIME_URL,
+                    at: Date.now()
+                }),
+                { headers: { 'Content-Type': 'application/json' } }
+            )
+        );
+    } catch (e) {
+        console.error('[impresspress-web] could not leave the cause for the boot shell:', e);
+    }
+}
+
+async function ensureInitialized() {
+    if (initialized) return;
+    if (initPromise) return await initPromise;
+    initPromise = (async () => {
+        console.log('[impresspress-web] Loading WASM module...');
+        try {
+            await init({ module_or_path: runtimeBinary() });
+        } catch (e) {
+            await selfDestruct(`wasm module load failed: ${e}`, STAGE_LOAD, true);
+            throw e;
+        }
+        console.log('[impresspress-web] Initializing runtime...');
+        await eraseSettled();
+        try {
+            await initialize({ dev: DEV_ENABLED, bypass: BYPASS_RULES, pageEngines: PAGE_ENGINES });
+        } catch (e) {
+            await selfDestruct(`runtime initialize() failed: ${e}`, STAGE_INITIALIZE, true);
+            throw e;
+        }
+        initialized = true;
+        console.log('[impresspress-web] Runtime ready.');
+    })();
+    try {
+        await initPromise;
+    } catch (e) {
+        // Not a start that failed: the next request looks again.
+        if (e instanceof ErasePending) initPromise = null;
+        throw e;
+    }
+}
+
+/**
+ * Ask the host for this version's runtime binary, past the browser's HTTP
+ * cache (`no-store`). Two versions can ask for the same binary at once — a
+ * recovery's replacement installing (`keepRuntime`) while the browser starts
+ * the old worker again for another tab, its kept copy dropped by that
+ * recovery (`runtimeBinary`) — and Chromium's HTTP cache holds a second
+ * request for a URL until the first has its response headers, for up to 20
+ * seconds: the old worker's start waited that long behind the install. The
+ * worker keeps the binary itself, in RUNTIME_CACHE, so the HTTP cache is
+ * needed only where that copy has gone.
+ *
+ * What this gives up is exactly that case, offline: a version installing, or
+ * a worker whose kept copy was dropped (a recovery) or evicted, cannot get
+ * its runtime without the host — the install fails, the start dies at stage
+ * `load` — where an HTTP cache entry might have answered before. That is the
+ * contract `dropCaches` in `loader.js` already states: a recovery's
+ * replacement fetches its own binary afresh, not a copy from before.
+ */
+function fetchRuntime() {
+    return fetch(RUNTIME_URL, { cache: 'no-store' });
+}
+
+/**
+ * This version's runtime binary, as a `Response` for `init()`: the one kept
+ * in RUNTIME_CACHE, or — where that entry has gone (a recovery dropped the
+ * caches, the browser evicted them) — the host's answer.
+ */
+async function runtimeBinary() {
+    try {
+        const cache = await caches.open(RUNTIME_CACHE);
+        const kept = await cache.match(RUNTIME_URL);
+        if (kept) return kept;
+    } catch (e) {
+        console.warn('[impresspress-web] could not read the kept runtime:', e);
+    }
+    return fetchRuntime();
+}
+
+// The first four bytes of every WebAssembly binary: `\0asm`.
+const WASM_MAGIC = [0x00, 0x61, 0x73, 0x6d];
+
+/**
+ * Keep this version's runtime binary (RUNTIME_CACHE says why). Throws when
+ * the host has no valid binary for it, which fails the install; a binary
+ * there is no room to keep is left on the host.
+ *
+ * What is kept must be a WebAssembly module, not merely a 200: a host that
+ * answers unknown paths with its app shell answers a binary it no longer
+ * has with an HTML page, and keeping that would install a version whose
+ * runtime can never load — and, at its `activate`, drop the binary of the
+ * version that worked. So the bytes are read and must begin with the wasm
+ * magic number; they are kept with the wasm media type whatever the host
+ * labelled them, which is what lets `init()` compile them as they stream.
+ * (A module that starts right and is still broken is not caught here; it
+ * fails `init()` at stage `load`, like any other.)
+ */
+async function keepRuntime() {
+    const cache = await caches.open(RUNTIME_CACHE);
+    if (await cache.match(RUNTIME_URL)) return;
+    const response = await fetchRuntime();
+    if (!response.ok) {
+        throw new Error(`the runtime ${RUNTIME_URL} could not be fetched: HTTP ${response.status}`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (!WASM_MAGIC.every((byte, i) => bytes[i] === byte)) {
+        throw new Error(
+            `the runtime ${RUNTIME_URL} is not a WebAssembly module ` +
+                `(the host answered ${response.headers.get('Content-Type') || 'no content type'})`
+        );
+    }
+    try {
+        await cache.put(
+            RUNTIME_URL,
+            new Response(bytes, { headers: { 'Content-Type': 'application/wasm' } })
+        );
+    } catch (e) {
+        // A full quota is not a reason to refuse the version: the binary is
+        // on the host, and `runtimeBinary` loads it from there. Refusing would
+        // also leave no way to free the space — "Reset" erases only once its
+        // replacement worker is in.
+        if (e && e.name === 'QuotaExceededError') {
+            console.warn('[impresspress-web] no room to keep the runtime; it will be loaded from the host:', e);
+            return;
+        }
+        throw e;
+    }
+}
+
+/**
+ * Drop the runtime binaries kept by every other version: once this one is
+ * active, no other version of this worker runs again.
+ */
+async function dropOtherRuntimes() {
+    try {
+        const cache = await caches.open(RUNTIME_CACHE);
+        for (const request of await cache.keys()) {
+            if (new URL(request.url).pathname !== RUNTIME_URL) await cache.delete(request);
+        }
+    } catch (e) {
+        console.warn('[impresspress-web] could not drop the other runtimes:', e);
+    }
+}
+
+self.addEventListener('install', (event) => {
+    console.log('[impresspress-web] Service Worker installing...');
+    event.waitUntil(Promise.all([keepRuntime(), self.skipWaiting()]));
+});
+
+// Once this version is active, a death some earlier version left for the
+// boot shell (`STOP_CAUSE_CACHE`) is no longer anyone's to recover from: the
+// worker that died has been replaced. Left there, a shell loading within the
+// minute it stays fresh would recover from it — and replace this worker.
+async function dropStaleCause() {
+    try {
+        await caches.delete(STOP_CAUSE_CACHE);
+    } catch (e) {
+        console.warn('[impresspress-web] could not drop a replaced worker’s cause:', e);
+    }
+}
+
+self.addEventListener('activate', (event) => {
+    console.log('[impresspress-web] Service Worker activating...');
+    event.waitUntil(Promise.all([dropOtherRuntimes(), dropStaleCause(), self.clients.claim()]));
+});
+
+// ---------------------------------------------------------------------------
+// Message bridge — replies from pages: the boot shell's, the asset loader's,
+// and the page-side engines' (bridge.js's "Page-side engines" section).
+// ---------------------------------------------------------------------------
+
+self.addEventListener('message', (event) => {
+    const msg = event.data;
+    if (!msg) return;
+
+    // The boot shell asking to be controlled. `clients.claim()` in `activate`
+    // reaches only the pages that existed then; a shell the static host
+    // served later, or a page loaded past the worker, is not this worker's —
+    // and until it is, its boot probe cannot reach the runtime. See
+    // `takeControl` in `loader.js`.
+    if (msg.type === 'impresspress-claim') {
+        event.waitUntil(self.clients.claim());
+        return;
+    }
+
+    // The boot shell asking which version this is — the runtime binary it
+    // was built for, the same `runtime` every report of a death carries.
+    // Answered whether or not the runtime is alive: it is how the shell
+    // tells a dead version from the one that has replaced it
+    // (`updateUnderway` in `loader.js`).
+    if (msg.type === 'impresspress-runtime') {
+        if (event.ports && event.ports[0]) event.ports[0].postMessage({ runtime: RUNTIME_URL });
+        return;
+    }
+
+    // Asset loader bridge: route reply to bridge.js's pending-load map.
+    // bridge.js exposes the resolver on globalThis because this script
+    // (sw.js) doesn't import the wasm-bindgen-generated bridge module.
+    if (msg.type === 'load-asset-response') {
+        if (typeof globalThis.__impresspressCompleteAssetLoad === 'function') {
+            globalThis.__impresspressCompleteAssetLoad(msg.id, {
+                status: msg.ok ? 'ready' : 'failed',
+                error: msg.ok ? undefined : msg.error,
+            });
+        }
+        return;
+    }
+
+    // A page saying it runs the engine a request is waiting to be sent to:
+    // bridge.js sends the request to the first page that says so.
+    if (msg.type === 'engine-present') {
+        if (typeof globalThis.__impresspressCompleteEngineProbe === 'function') {
+            globalThis.__impresspressCompleteEngineProbe(msg);
+        }
+        return;
+    }
+
+    // LLM bridge: route all llm-* replies from the page to bridge.js's handler.
+    if (typeof msg.type === 'string' && msg.type.startsWith('llm-')) {
+        if (typeof globalThis.__impresspressCompleteLlmMessage === 'function') {
+            globalThis.__impresspressCompleteLlmMessage(msg);
+        }
+        return;
+    }
+
+    // Embed bridge: route all embed-*-response replies from the page to bridge.js's handler.
+    if (typeof msg.type === 'string' && msg.type.startsWith('embed-') && msg.type.endsWith('-response')) {
+        if (typeof globalThis.__impresspressCompleteEmbedMessage === 'function') {
+            globalThis.__impresspressCompleteEmbedMessage(msg);
+        }
+        return;
+    }
+
+    // Image bridge: route all image-* replies (one-shot responses and stream
+    // frames) from the page to bridge.js's handler.
+    if (typeof msg.type === 'string' && msg.type.startsWith('image-')) {
+        if (typeof globalThis.__impresspressCompleteImageMessage === 'function') {
+            globalThis.__impresspressCompleteImageMessage(msg);
+        }
+        return;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Fetch handler
+// ---------------------------------------------------------------------------
+
+self.addEventListener('fetch', (event) => {
+    const url = new URL(event.request.url);
+    // Only intercept same-origin requests
+    if (url.origin !== self.location.origin) return;
+    // The requests the network answers instead of the wasm runtime: the SW's
+    // own script, the boot loader, the PWA and asset manifests, the wasm-pack
+    // / bundler output, the shell's vendored files, Cloudflare's `/cdn-cgi/`
+    // namespace, and whatever the app adds (`--extra-bypass-prefix`,
+    // `--extra-bypass-exact`; `/seed/` in a dev bundle). `/` and `/index.html`
+    // are intentionally INTERCEPTED unless the app lists them, so the
+    // consumer's router can render a UI block at root.
+    //
+    // The condition is rendered whole from `impresspress-bundle`'s
+    // `BypassRules` (`bundle/bypass.rs`, which says why each rule is there),
+    // the same value `BYPASS_RULES` above states as data for the runtime. A
+    // rule added here by hand would be a rule the runtime does not know of.
+    if (url.pathname === '/sw.js' ||
+        url.pathname === '/loader.js' ||
+        url.pathname === '/manifest.json' ||
+        url.pathname === '/asset-manifest.json' ||
+        url.pathname === '/webllm-engine.js' ||
+        url.pathname === '/embed-engine.js' ||
+        url.pathname === '/t2i-engine.js' ||
+        url.pathname === '/vendor/sql-wasm-esm.js' ||
+        url.pathname === '/vendor/sql-wasm.wasm' ||
+        url.pathname.startsWith('/impresspress_web') ||
+        url.pathname.startsWith('/snippets/') ||
+        url.pathname.startsWith('/cdn-cgi/')) {
+        // ------------------------------------------------------------------
+        // Bypassed — the network answers this, not the wasm runtime.
+        //
+        // In a NON-dev bundle that is the whole story: return, and the
+        // browser performs the fetch it would have performed with no service
+        // worker at all.
+        //
+        // In a DEV bundle it is not, and the reason is a rule that is easy to
+        // miss. A document with a `Cross-Origin-Embedder-Policy` inherits
+        // that policy to every dedicated worker it starts, and the browser
+        // REFUSES to start one whose own script response does not carry a
+        // compatible COEP. The sandbox's `/b/dev` is COEP `credentialless`
+        // (it needs `SharedArrayBuffer` for the in-browser Rust toolchain),
+        // and the toolchain's worker script is one of the files bypassed
+        // above — a quarter of a gigabyte of static assets that must not go
+        // through wasm. So the runtime never sees that response and cannot
+        // put a header on it; the static host does, and a static host that
+        // says nothing gets `net::ERR_BLOCKED_BY_RESPONSE` plus a `Worker`
+        // `error` event with an empty message, which is all the page can ever
+        // be told.
+        //
+        // Which static host? `python3 -m http.server` in CI, Cloudflare's
+        // asset server in production, whatever a contributor runs locally.
+        // "Every host that ever serves this bundle must be configured to send
+        // a header" is a rule with no enforcement point. The service worker
+        // is the one thing that ships INSIDE the bundle and sits in front of
+        // every same-origin request, so it is the deployment's header layer —
+        // the coi-serviceworker pattern, applied to the requests this worker
+        // otherwise waves through.
+        //
+        // Hence: a dev bundle answers the bypassed request itself, with the
+        // network's own response plus the cross-origin-isolation pair. The
+        // pair matches what the runtime already sends on everything it serves
+        // in a dev deployment (the security-headers block's
+        // `cross_origin_isolation`), so this makes the static files CONSISTENT
+        // with the rest of the origin rather than special.
+        //
+        // `credentialless` rather than `require-corp`: a site an agent built
+        // in this sandbox can still show a cross-origin image that carries no
+        // `Cross-Origin-Resource-Policy`, which under `require-corp` it could
+        // not.
+        //
+        // Every bypassed path, not just the toolchain's: the bypass list is
+        // the APP's (`--extra-bypass-prefix`), so this worker cannot know
+        // which of those prefixes an app loads a worker script from — and the
+        // headers are inert on every response that is neither a document nor
+        // a worker script, so widening the rule costs nothing and narrowing it
+        // would be a guess.
+        //
+        // `/sw.js` is kept out. The browser fetches a worker's own script
+        // outside any worker's `fetch` handler, so this branch should never
+        // see it; if some future browser routes it here anyway, answering it
+        // from inside the worker being replaced is how an update check gets a
+        // stale script.
+        //
+        // The condition below reads `DEV_ENABLED`, the single build-time
+        // constant declared at the top of this file (the same one
+        // `initialize()` is passed), so the difference between a dev bundle
+        // and a plain one is visible in ONE line of the shipped file rather
+        // than decided at runtime — and a non-dev bundle keeps the plain
+        // early return it always had. Flipping that one line is also exactly
+        // what the sandbox's export rewrites to ship the shell with the
+        // sandbox off (`blocks/dev/export.rs`).
+        // ------------------------------------------------------------------
+        if (DEV_ENABLED && url.pathname !== '/sw.js') {
+            event.respondWith(passthrough(event.request));
+        }
+        return;
+    }
+    event.respondWith(handleFetch(event));
+});
+
+/**
+ * The network's answer to a bypassed request, plus the cross-origin-isolation
+ * headers. See the long comment in the `fetch` listener for why this exists.
+ *
+ * The body is PIPED, never buffered: the assets this runs on include
+ * multi-megabyte wasm parts, and reading one into an ArrayBuffer to hand it
+ * back would double the peak memory of every load for no gain. `response.body`
+ * is the original stream; the new `Response` wraps it.
+ *
+ * An opaque, opaque-redirect or error response is returned untouched. Its
+ * headers are not readable and its body is not exposed, so constructing a new
+ * `Response` from one does not copy it — it silently replaces it with an empty
+ * 200, which is far worse than the missing header this function exists to add.
+ * (Same-origin requests should never produce one here, since the cross-origin
+ * check above already returned; this is the guard for the case where they do.)
+ */
+async function passthrough(request) {
+    const response = await fetch(request);
+    if (response.type === 'opaque' || response.type === 'opaqueredirect' || response.type === 'error') {
+        return response;
+    }
+    const headers = new Headers(response.headers);
+    headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
+    headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+    // `response.body` is null exactly for the statuses that may not have one
+    // (204, 205, 304), which is also the set `new Response` rejects a body
+    // for — so this one expression is correct for both cases.
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+    });
+}
+
+async function handleFetch(event) {
+    const request = event.request;
+    if (poisoned) {
+        // wasm is dead, and this worker is still the one every request in
+        // its scope reaches.
+        return runtimeStopped(request);
+    }
+    try {
+        await ensureInitialized();
+        // `after` is the work the request left to run once its response is
+        // out: its request-log row and whatever its handlers deferred. The
+        // response does not wait for it, and nothing but `waitUntil` keeps
+        // this worker alive until it has run — the browser may stop an idle
+        // worker as soon as the response is delivered. Registered while the
+        // `respondWith` promise is still pending, which is when `waitUntil`
+        // may still be called. `handle_request` resolves only once every
+        // database change completed before the request ended, whichever
+        // request made it, is written (the epoch rule in impresspress-browser's
+        // `flush_scope.rs`); only this work is at stake.
+        const { response, after } = await handle_request(request);
+        event.waitUntil(after);
+        return response;
+    } catch (error) {
+        if (error instanceof ErasePending) return beingReset(request);
+        console.error('[impresspress-web] Error handling request:', error);
+        // wasm-bindgen surfaces a `RuntimeError` for an `unreachable` trap;
+        // ensureInitialized() also throws for `init()` / `initialize()`
+        // failures, having self-destructed already with its own stage (the
+        // call below is then a no-op). Both modes mean the wasm instance is
+        // unusable for the rest of this SW's life. What is left to decide
+        // here is the trap in a running runtime, and it turns on what was
+        // asked for — see `selfDestruct`: a failed navigation sends the open
+        // pages to the boot shell, a failed request from a page leaves the
+        // page alone to show the answer below.
+        await selfDestruct(
+            `error handling request: ${error}`,
+            STAGE_REQUEST,
+            request.mode === 'navigate'
+        );
+        return runtimeStopped(request);
+    }
+}
+
+/**
+ * The answer of a worker while an erase of the app's data is pending
+ * (`eraseSettled`): it has loaded nothing and is not dead.
+ *
+ * A navigation gets the boot shell, with no cause left for it: the shell's
+ * ordinary boot waits for the version coming in to activate, asks again, and
+ * comes back to the page once the app answers (`enterApp` in `loader.js`). Anything else gets a 503 in the runtime's error shape that is
+ * NOT the stopped-runtime answer (`runtimeStopped`) — no `stage`, no
+ * `cause`, another `code` — so no shell takes it for a death to recover
+ * from; its message says what is happening and what to do.
+ */
+async function beingReset(request) {
+    if (request.mode === 'navigate') return bootShell();
+    const body = {
+        error: 'Unavailable',
+        message: 'The app is being reset. Reload the page in a moment.',
+        code: 'app_resetting'
+    };
+    return new Response(JSON.stringify(body), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+    });
+}
+
+/**
+ * Whether the recovery `loader.js` runs for this worker's failure erases the
+ * data this browser stores for the app. The same rule as `erasesFor` there:
+ * the build allows it, and the failure was the runtime's `initialize()`.
+ */
+function recoveryErases() {
+    return OPFS_WIPE_ON_RECOVERY && poisonStage === STAGE_INITIALIZE;
+}
+
+/**
+ * The answer to a request the runtime would have handled, once the runtime
+ * is dead (`poisoned`).
+ *
+ * A NAVIGATION is answered with the boot shell (`bootShell`), at the address
+ * that was asked for, and `loader.js` shows the cause this leaves for it and
+ * runs its recovery path.
+ *
+ * Nothing else is. What reaches `handleFetch` is a request the runtime was
+ * going to answer — an API call, a form post — and the static host has
+ * nothing of its own to say to one: an empty 405, a 404 page, or `index.html`
+ * with a 200 where it falls back for unknown paths. The script that made the
+ * request can then report nothing but "something went wrong": the cause is in
+ * THIS worker's console, which neither the person nor an agent driving the
+ * page can read. So the worker answers it itself, in the shape the runtime
+ * gives every error (`wafer_block::http_codec::error_to_http_response`:
+ * `error` is the coarse code, `message` the human text, `code` the precise
+ * one), with the cause in the message. A page that shows `message` — every
+ * auth form does — then shows the cause.
+ *
+ * The message ends with what a reload of the page does. A reload is a
+ * navigation, this worker answers it with the boot shell and leaves the
+ * cause, and the shell acts on the cause:
+ *
+ * - `recoveryErases()` — its recovery erases the app's local data, and the
+ *   message says so rather than calling it a restart. "May", because that
+ *   recovery runs automatically only once per tab (after that the shell
+ *   stops and asks) and only once per death (another tab may already have
+ *   done it), and because the browser may have stopped this worker by then:
+ *   the reload then starts a new one, which tries the runtime again and may
+ *   simply work.
+ * - otherwise — the shell replaces this worker with a fresh one and comes
+ *   back to the page; nothing is erased. True on any static host, since the
+ *   reload never reaches the host.
+ */
+async function runtimeStopped(request) {
+    if (request.mode === 'navigate') {
+        await leaveCauseForBootShell();
+        return bootShell();
+    }
+    const next = recoveryErases()
+        ? 'Reloading the page may run a recovery that erases the data this browser stores for the app.'
+        : 'Reload the page to restart it; the data this browser stores for the app is kept.';
+    // `cause`, `stage`, `id` and `runtime` are the fields the runtime's
+    // shape does not have: the bare reason, where it failed, which death
+    // this is and which version died (`reportedRuntime`), for `loader.js`, whose boot probe is a request like any other and
+    // which words the sentence around them itself.
+    const body = {
+        error: 'Unavailable',
+        message: `The app's runtime stopped (${poisonReason}). ${next}`,
+        code: 'runtime_stopped',
+        cause: poisonReason,
+        stage: poisonStage,
+        id: poisonId,
+        runtime: RUNTIME_URL
+    };
+    return new Response(JSON.stringify(body), {
+        status: 503,
+        headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store'
+        }
+    });
+}
+
+/**
+ * The boot shell's document, as the answer to a navigation to a dead runtime.
+ *
+ * Fetched from SHELL_URL and not from the address that was asked for. Handing
+ * the navigation itself to the static host only works where the host answers
+ * unknown paths with the shell; a plain file server answers `/b/…` with its
+ * own 404, the shell never loads, and the cause this worker left is never
+ * shown. The shell's own address is the one the host must have.
+ *
+ * A document, not a redirect: the address bar keeps what was asked for, and
+ * nothing here can go round — this worker answers, and `loader.js` decides
+ * what happens next. The shell loads `/loader.js` and its other scripts by
+ * absolute path, and those are on the bypass list, so the fetch handler above
+ * leaves them to the network (or to `passthrough`) even now.
+ *
+ * Rebuilt rather than returned as fetched: a host that answers SHELL_URL by
+ * redirecting (to `/index.html`, say) gives a response marked as redirected,
+ * which a browser refuses as the answer to a navigation. The body is piped,
+ * as in `passthrough`. Whatever the host said is passed on — if it has no
+ * shell at SHELL_URL, its answer is the truth about this deployment.
+ *
+ * With the host's headers and no others, in a dev bundle too: unlike
+ * `passthrough`, this adds no cross-origin-isolation pair. The shell is the
+ * same document a first visit gets straight from the host, which has no such
+ * headers either; it starts no worker and needs no `SharedArrayBuffer`, and
+ * a document without an embedder policy may load every script the shell
+ * loads. The pages that must be isolated are the runtime's, and they are
+ * again once the recovery has a runtime serving them
+ * (`dev-stopped-navigation.spec.ts` checks both halves in a browser).
+ */
+async function bootShell() {
+    const shell = await fetch(SHELL_URL, { cache: 'no-store' });
+    return new Response(shell.body, {
+        status: shell.status,
+        statusText: shell.statusText,
+        headers: shell.headers
+    });
+}
