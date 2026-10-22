@@ -1,0 +1,55 @@
+{
+  "buildId": "2994f253",
+  "assets": {
+    "impresspress_web.js": "/impresspress_web-e36fbffe.js",
+    "impresspress_web_bg.wasm": "/impresspress_web_bg-ae546ed0.wasm"
+  },
+  "files": [
+    "asset-manifest.json",
+    "embed-engine.js",
+    "impresspress_web-e36fbffe.js",
+    "impresspress_web_bg-ae546ed0.wasm",
+    "index.html",
+    "loader.js",
+    "snippets/impresspress-browser-c1e2ee996fd2ab06/js/bridge.js",
+    "sw.js",
+    "t2i-engine.js",
+    "vendor/sql-wasm-esm.js",
+    "vendor/sql-wasm.wasm",
+    "webllm-engine.js"
+  ],
+  "bypass": {
+    "exact": [
+      "/sw.js",
+      "/loader.js",
+      "/manifest.json",
+      "/asset-manifest.json",
+      "/webllm-engine.js",
+      "/embed-engine.js",
+      "/t2i-engine.js",
+      "/vendor/sql-wasm-esm.js",
+      "/vendor/sql-wasm.wasm",
+      "/icon-192.png",
+      "/icon-512.png"
+    ],
+    "prefixes": [
+      "/impresspress_web",
+      "/snippets/",
+      "/cdn-cgi/"
+    ]
+  },
+  "shellPath": "/",
+  "sha256": {
+    "embed-engine.js": "7b0bb3b655d60bf0193c4641a93979c7bb94c4419d3007665ad30db8fd29d135",
+    "impresspress_web-e36fbffe.js": "e36fbffe2b988c8020851a8f323a1acc70ff38a6bbf6085a891e48c58c5a4bef",
+    "impresspress_web_bg-ae546ed0.wasm": "ae546ed01f207cfcd7ca3f8050a90e3edd15c2796b9f4227f7717e910c7d1272",
+    "index.html": "e720c8d98c1018c0d2a7ac91731d177ef30dda26bd15e0c0e01a50bc1ed1a39e",
+    "loader.js": "556d3744098403a62b57f11239154369719ce2412c03561d0c2c5292820bb804",
+    "snippets/impresspress-browser-c1e2ee996fd2ab06/js/bridge.js": "2e2b851520bb6e5489aa4680eadc2e4daadd84f5a8f474d3633f53ed22bf103d",
+    "sw.js": "64d3917fd66f7f372d01daad5a2ce0b41d9fcf6ef8a3c3f994a1480309a5f19c",
+    "t2i-engine.js": "3345613cd75fe1b9ef0ce66a2b567bc6a190aa9b22aae39aa77dd2c3c4445e0e",
+    "vendor/sql-wasm-esm.js": "886a01d1a2b215b14fe362166023fa2f3f068fc71c0464e03bcdd5d4c10564c2",
+    "vendor/sql-wasm.wasm": "1233c4477b9a5e2d9acf050b6d0f77a6778c9ac48cc9fbc9ff97ffc1176997f6",
+    "webllm-engine.js": "fb9ea9644b9c1aa448fed5e2d474cb85e3eb247c53b8bbb99ca98c706caa41eb"
+  }
+}
